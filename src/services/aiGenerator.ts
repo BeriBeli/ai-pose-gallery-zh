@@ -1,4 +1,4 @@
-import type { ApiConfig, ImageProviderId, RecipeState } from '@/types/gallery'
+import type { ApiConfig, GptParams, ImageProviderId, RecipeState } from '@/types/gallery'
 import qwen2509ThreeImageWorkflow from '@/workflows/qwen_image_edit_2509_3img.api.json'
 
 export interface ProviderModelOption {
@@ -38,12 +38,10 @@ export const PROVIDER_META: Record<
     defaultBaseUrl: 'https://api.openai.com/v1',
     docUrl: 'https://platform.openai.com/docs/guides/image-generation',
     models: [
-      { value: 'gpt-image-2.5', label: 'gpt-image-2.5' },
-      { value: 'gpt-image-2.5-sunburst', label: 'gpt-image-2.5-sunburst' },
-      { value: 'gpt-image-2.5-flare', label: 'gpt-image-2.5-flare' },
+      { value: 'gpt-image-2.5-sunburst', label: 'gpt-image-2.5-sunburst（质量优先）' },
+      { value: 'gpt-image-2.5-flare', label: 'gpt-image-2.5-flare（速度优先）' },
       { value: 'gpt-image-2', label: 'gpt-image-2' },
-      { value: 'gpt-image-1.5', label: 'gpt-image-1.5' },
-      { value: 'gpt-image-1', label: 'gpt-image-1' },
+      { value: 'gpt-image-1.5', label: 'gpt-image-1.5（2026-12-01 停用）' },
       { value: 'custom', label: '自定义模型 ID' },
     ],
   },
@@ -384,6 +382,77 @@ async function smartFetch(
     headers,
     body: init.body,
   })
+}
+
+// ---------------------------------------------------------------------------
+// GPT Image 参数能力判断
+// ---------------------------------------------------------------------------
+
+const GPT_IMAGE_25_RE = /^gpt-image-2\.5(?:-|$)/
+const GPT_IMAGE_2_RE = /^gpt-image-2(?:-|$)/
+
+export function isGptImage25(model: string): boolean {
+  return GPT_IMAGE_25_RE.test(model)
+}
+
+/** gpt-image-2 / 2.5 支持任意 16 倍数尺寸；1.5 仅支持三个标准尺寸 */
+function supportsCustomGptSize(model: string): boolean {
+  return GPT_IMAGE_25_RE.test(model) || GPT_IMAGE_2_RE.test(model)
+}
+
+function resolveGptSize(g: GptParams, model: string): string {
+  if (g.size !== 'custom') return g.size
+  if (!supportsCustomGptSize(model)) {
+    throw new Error('自定义尺寸仅支持 gpt-image-2 / gpt-image-2.5，请改用标准尺寸或切换模型')
+  }
+  const raw = g.customSize.trim().toLowerCase()
+  const match = raw.match(/^(\d+)x(\d+)$/)
+  if (!match) {
+    throw new Error('自定义尺寸格式应为「宽x高」，例如 1536x2048')
+  }
+  const width = Number(match[1])
+  const height = Number(match[2])
+  const long = Math.max(width, height)
+  const short = Math.min(width, height)
+  if (!width || !height || width % 16 !== 0 || height % 16 !== 0) {
+    throw new Error('自定义尺寸的宽和高都必须是大于 0 且能被 16 整除的整数')
+  }
+  if (long > 3840) {
+    throw new Error('自定义尺寸单边不能超过 3840 像素')
+  }
+  if (long / short > 3) {
+    throw new Error('自定义尺寸长短边比例不能超过 3:1')
+  }
+  const pixels = width * height
+  if (pixels < 655_360 || pixels > 8_294_400) {
+    throw new Error('自定义尺寸像素总数需在 655,360 到 8,294,400 之间')
+  }
+  return `${width}x${height}`
+}
+
+function resolveGptQuality(model: string, quality: GptParams['quality']): GptParams['quality'] {
+  if ((quality === 'xhigh' || quality === 'max') && !isGptImage25(model)) {
+    throw new Error('quality=xhigh/max 仅支持 gpt-image-2.5 系列，请改用 high 或 auto')
+  }
+  return quality
+}
+
+function resolveGptInputFidelity(
+  model: string,
+  fidelity: GptParams['inputFidelity']
+): 'high' | 'low' | undefined {
+  if (fidelity === 'omit') return undefined
+  // 官方：仅 gpt-image-1.5 支持 high/low；gpt-image-1-mini 仅支持 low。
+  // gpt-image-2 必须省略；2.5 的官方参数表也未列出该项，因此一律不发送。
+  if (model.startsWith('gpt-image-1.5')) return fidelity
+  if (model.startsWith('gpt-image-1-mini')) return 'low'
+  return undefined
+}
+
+function resolveGptOutputFormat(g: GptParams): 'png' | 'jpeg' | 'webp' {
+  // 透明背景只支持 png / webp
+  if (g.background === 'transparent' && g.outputFormat === 'jpeg') return 'png'
+  return g.outputFormat
 }
 
 function extractUniversalImage(json: any): string | null {
@@ -1351,11 +1420,19 @@ export async function generateCharacterImage(params: {
   let json: any
 
   // =========================================================================
-  // 协议 1: OpenAI GPT Image (gpt-image-2.5 / gpt-image-2 / gpt-image-1.5 / 1)
+  // 协议 1: OpenAI GPT Image (gpt-image-2.5-sunburst / flare / 2 / 1.5)
   // =========================================================================
   if (provider === 'gpt') {
     const g = config.gptParams
     const v1 = baseUrl.endsWith('/v1') ? baseUrl : `${baseUrl}/v1`
+    const isChatMode = g.endpointMode === 'chat'
+    // chat 模式只把 model / prompt / images 交给中转站，不发送这些图像 API 参数
+    const gptSize = isChatMode ? 'auto' : resolveGptSize(g, model)
+    const gptQuality = isChatMode ? 'auto' : resolveGptQuality(model, g.quality)
+    const gptInputFidelity = isChatMode
+      ? undefined
+      : resolveGptInputFidelity(model, g.inputFidelity)
+    const gptOutputFormat = resolveGptOutputFormat(g)
 
     if (g.endpointMode === 'images_edits_json') {
       // OpenAI 最新 /v1/images/edits JSON 协议：直接传 images: [{ image_url: "https://..." }]，无需上传文件流！
@@ -1363,12 +1440,12 @@ export async function generateCharacterImage(params: {
         model,
         prompt,
         images: allImageRefs.map((ref) => ({ image_url: ref })),
+        background: g.background,
+        output_format: gptOutputFormat,
       }
-      if (g.size !== 'auto') payload.size = g.size
-      if (g.quality !== 'auto') payload.quality = g.quality
-      if (g.inputFidelity) payload.input_fidelity = g.inputFidelity
-      if (g.background !== 'auto') payload.background = g.background
-      if (g.outputFormat) payload.output_format = g.outputFormat
+      if (gptSize !== 'auto') payload.size = gptSize
+      if (gptQuality !== 'auto') payload.quality = gptQuality
+      if (gptInputFidelity) payload.input_fidelity = gptInputFidelity
       if (g.moderation !== 'auto') payload.moderation = g.moderation
 
       res = await smartFetch(
@@ -1392,11 +1469,11 @@ export async function generateCharacterImage(params: {
       allImageRefs.forEach((du, i) => {
         fd.append('image[]', dataUrlToBlob(du), `ref_${i + 1}.png`)
       })
-      if (g.size !== 'auto') fd.append('size', g.size)
-      if (g.quality !== 'auto') fd.append('quality', g.quality)
-      if (g.inputFidelity) fd.append('input_fidelity', g.inputFidelity)
+      if (gptSize !== 'auto') fd.append('size', gptSize)
+      if (gptQuality !== 'auto') fd.append('quality', gptQuality)
+      if (gptInputFidelity) fd.append('input_fidelity', gptInputFidelity)
       if (g.background !== 'auto') fd.append('background', g.background)
-      if (g.outputFormat) fd.append('output_format', g.outputFormat)
+      fd.append('output_format', gptOutputFormat)
       if (g.moderation !== 'auto') fd.append('moderation', g.moderation)
 
       res = await smartFetch(
@@ -1410,17 +1487,20 @@ export async function generateCharacterImage(params: {
       )
       json = await res.json()
     } else if (g.endpointMode === 'responses') {
-      // OpenAI Responses API (/v1/responses) 支持直接传 HTTPS image_url 或 Base64
+      // Responses API：顶层 model 必须是主模型，图像模型放在 tools[0].model
       const inputContent = [
         ...allImageRefs.map((ref) => ({ type: 'input_image', image_url: ref })),
         { type: 'input_text', text: prompt },
       ]
-      const toolCfg: Record<string, any> = { type: 'image_generation' }
-      if (g.size !== 'auto') toolCfg.size = g.size
-      if (g.quality !== 'auto') toolCfg.quality = g.quality
+      const toolCfg: Record<string, any> = { type: 'image_generation', model }
+      if (gptSize !== 'auto') toolCfg.size = gptSize
+      if (gptQuality !== 'auto') toolCfg.quality = gptQuality
       if (g.background !== 'auto') toolCfg.background = g.background
-      if (g.inputFidelity) toolCfg.input_fidelity = g.inputFidelity
-      if (g.outputFormat) toolCfg.output_format = g.outputFormat
+      if (gptInputFidelity) toolCfg.input_fidelity = gptInputFidelity
+      toolCfg.output_format = gptOutputFormat
+      if (g.moderation !== 'auto') toolCfg.moderation = g.moderation
+
+      const responsesModel = g.responsesModel.trim() || 'gpt-6-astra'
 
       res = await smartFetch(
         `${v1}/responses`,
@@ -1431,7 +1511,7 @@ export async function generateCharacterImage(params: {
             Authorization: `Bearer ${apiKey}`,
           },
           body: JSON.stringify({
-            model,
+            model: responsesModel,
             input: [{ role: 'user', content: inputContent }],
             tools: [toolCfg],
           }),
@@ -1440,7 +1520,12 @@ export async function generateCharacterImage(params: {
       )
       json = await res.json()
     } else {
-      // 兼容中转站 Chat Completions，支持直接传 HTTPS URL
+      // 兼容中转站 Chat Completions；官方 OpenAI 的 GPT Image 模型不支持该端点
+      if (/api\.openai\.com/i.test(baseUrl)) {
+        throw new Error(
+          'OpenAI 官方 GPT Image 不支持 /v1/chat/completions；请改用 Images/Responses 端点，或填写第三方中转站 Base URL'
+        )
+      }
       const content = [
         { type: 'text', text: prompt },
         ...allImageRefs.map((ref) => ({ type: 'image_url', image_url: { url: ref } })),

@@ -93,9 +93,14 @@ export interface ComfyUiParams {
 
 export interface GptParams {
   endpointMode: 'images_edits_json' | 'images_edits' | 'responses' | 'chat'
-  size: 'auto' | '1024x1536' | '1024x1024' | '1536x1024'
+  size: 'auto' | '1024x1536' | '1024x1024' | '1536x1024' | 'custom'
+  /** size 为 custom 时使用，格式为 WIDTHxHEIGHT */
+  customSize: string
+  /** Responses 模式顶层的文本/多模态主模型，图像模型放在 tools[0].model */
+  responsesModel: string
   quality: 'auto' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
-  inputFidelity: 'high' | 'low'
+  /** omit 表示不发送；官方仅 gpt-image-1.5 支持 high/low，2/2.5 应省略 */
+  inputFidelity: 'omit' | 'high' | 'low'
   background: 'auto' | 'opaque' | 'transparent'
   outputFormat: 'png' | 'jpeg' | 'webp'
   moderation: 'auto' | 'low'

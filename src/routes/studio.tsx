@@ -46,6 +46,7 @@ import {
   COMFYUI_WORKFLOW_TEMPLATES,
   detectComfyUi,
   fileToDataUrl,
+  isGptImage25,
   parseComfyWorkflowNodes,
   PROVIDER_META,
   stitchRecipeCanvas,
@@ -113,6 +114,11 @@ function StudioPage() {
   const activeProvider = apiConfig.activeProvider
   const providerMeta = PROVIDER_META[activeProvider]
   const providerCfg = apiConfig.providers[activeProvider]
+  const gptModel =
+    apiConfig.providers.gpt.model === 'custom'
+      ? apiConfig.providers.gpt.customModel.trim()
+      : apiConfig.providers.gpt.model
+  const gptIs25 = isGptImage25(gptModel)
 
   const defaultPrompt = buildRecipePrompt(recipe, apiConfig.stylePreset)
   const prompt = customPrompt ?? defaultPrompt
@@ -808,7 +814,26 @@ function StudioPage() {
                 <Field label="模型 ID">
                   <Select
                     value={providerCfg.model}
-                    onValueChange={(v) => updateProviderConfig(activeProvider, { model: v })}
+                    onValueChange={(v) => {
+                      updateProviderConfig(activeProvider, { model: v })
+                      if (activeProvider === 'gpt') {
+                        const nextModel =
+                          v === 'custom' ? apiConfig.providers.gpt.customModel.trim() : v
+                        if (
+                          !isGptImage25(nextModel) &&
+                          (apiConfig.gptParams.quality === 'xhigh' ||
+                            apiConfig.gptParams.quality === 'max')
+                        ) {
+                          updateGptParams({ quality: 'high' })
+                        }
+                        if (
+                          !nextModel.startsWith('gpt-image-1.5') &&
+                          !nextModel.startsWith('gpt-image-1-mini')
+                        ) {
+                          updateGptParams({ inputFidelity: 'omit' })
+                        }
+                      }
+                    }}
                   >
                     <SelectTrigger className="w-full font-mono text-xs">
                       <SelectValue />
@@ -1004,7 +1029,16 @@ function StudioPage() {
 
                 {activeProvider === 'gpt' && (
                   <>
-                    <Field label="调用端点 (endpointMode)">
+                    <Field
+                      label="调用端点 (endpointMode)"
+                      hint={
+                        apiConfig.gptParams.endpointMode === 'responses'
+                          ? 'Responses 模式下顶层 model 必须是主模型，图像模型会自动放入 tools[0].model。'
+                          : apiConfig.gptParams.endpointMode === 'chat'
+                            ? '官方 OpenAI 的 GPT Image 不支持 Chat Completions；此模式仅用于第三方兼容中转站。'
+                            : undefined
+                      }
+                    >
                       <Select
                         value={apiConfig.gptParams.endpointMode}
                         onValueChange={(v) =>
@@ -1016,12 +1050,27 @@ function StudioPage() {
                         </SelectTrigger>
                         <SelectContent>
                           <SelectItem value="images_edits_json">/v1/images/edits (JSON)</SelectItem>
-                          <SelectItem value="responses">/v1/responses</SelectItem>
-                          <SelectItem value="chat">/v1/chat/completions</SelectItem>
+                          <SelectItem value="responses">/v1/responses（需主模型）</SelectItem>
+                          <SelectItem value="chat">/v1/chat/completions（仅中转站）</SelectItem>
                           <SelectItem value="images_edits">/v1/images/edits (Multipart)</SelectItem>
                         </SelectContent>
                       </Select>
                     </Field>
+
+                    {apiConfig.gptParams.endpointMode === 'responses' && (
+                      <Field
+                        label="Responses 主模型"
+                        hint="必须是支持 Responses 的主模型（如 gpt-6-astra）；上方「模型 ID」是图像模型。"
+                      >
+                        <Input
+                          value={apiConfig.gptParams.responsesModel}
+                          onChange={(e) => updateGptParams({ responsesModel: e.target.value })}
+                          placeholder="gpt-6-astra"
+                          className="bg-background font-mono text-xs"
+                        />
+                      </Field>
+                    )}
+
                     <Field label="输出尺寸 (size)">
                       <Select
                         value={apiConfig.gptParams.size}
@@ -1035,10 +1084,29 @@ function StudioPage() {
                           <SelectItem value="1024x1024">1024x1024</SelectItem>
                           <SelectItem value="1536x1024">1536x1024</SelectItem>
                           <SelectItem value="auto">auto</SelectItem>
+                          <SelectItem value="custom">自定义尺寸</SelectItem>
                         </SelectContent>
                       </Select>
                     </Field>
-                    <Field label="渲染质量 (quality)">
+
+                    {apiConfig.gptParams.size === 'custom' && (
+                      <Field
+                        label="自定义尺寸 (宽x高)"
+                        hint="宽高需为 16 的倍数，长短边比 ≤ 3:1，单边 ≤ 3840，像素总数 655,360–8,294,400；仅 gpt-image-2 / 2.5 支持。"
+                      >
+                        <Input
+                          value={apiConfig.gptParams.customSize}
+                          onChange={(e) => updateGptParams({ customSize: e.target.value })}
+                          placeholder="1536x2048"
+                          className="bg-background font-mono text-xs"
+                        />
+                      </Field>
+                    )}
+
+                    <Field
+                      label="渲染质量 (quality)"
+                      hint="xhigh / max 仅 gpt-image-2.5 系列支持；其他模型请使用 high 或 auto。"
+                    >
                       <Select
                         value={apiConfig.gptParams.quality}
                         onValueChange={(v) => updateGptParams({ quality: v as GptParams['quality'] })}
@@ -1048,15 +1116,19 @@ function StudioPage() {
                         </SelectTrigger>
                         <SelectContent>
                           <SelectItem value="high">high</SelectItem>
-                          <SelectItem value="xhigh">xhigh</SelectItem>
-                          <SelectItem value="max">max</SelectItem>
+                          {gptIs25 && <SelectItem value="xhigh">xhigh（仅 2.5）</SelectItem>}
+                          {gptIs25 && <SelectItem value="max">max（仅 2.5）</SelectItem>}
                           <SelectItem value="medium">medium</SelectItem>
                           <SelectItem value="low">low</SelectItem>
                           <SelectItem value="auto">auto</SelectItem>
                         </SelectContent>
                       </Select>
                     </Field>
-                    <Field label="参考还原度 (input_fidelity)">
+
+                    <Field
+                      label="参考还原度 (input_fidelity)"
+                      hint="官方仅 gpt-image-1.5 支持 high/low；gpt-image-2 必须省略，2.5 参数表也未列出。默认不发送。"
+                    >
                       <Select
                         value={apiConfig.gptParams.inputFidelity}
                         onValueChange={(v) =>
@@ -1067,17 +1139,26 @@ function StudioPage() {
                           <SelectValue />
                         </SelectTrigger>
                         <SelectContent>
-                          <SelectItem value="high">high</SelectItem>
-                          <SelectItem value="low">low</SelectItem>
+                          <SelectItem value="omit">omit（不发送，推荐 2 / 2.5）</SelectItem>
+                          <SelectItem value="high">high（仅 1.5）</SelectItem>
+                          <SelectItem value="low">low（1.5 / 1-mini）</SelectItem>
                         </SelectContent>
                       </Select>
                     </Field>
+
                     <Field label="背景模式 (background)">
                       <Select
                         value={apiConfig.gptParams.background}
-                        onValueChange={(v) =>
-                          updateGptParams({ background: v as GptParams['background'] })
-                        }
+                        onValueChange={(v) => {
+                          const background = v as GptParams['background']
+                          updateGptParams({
+                            background,
+                            ...(background === 'transparent' &&
+                            apiConfig.gptParams.outputFormat === 'jpeg'
+                              ? { outputFormat: 'png' as const }
+                              : {}),
+                          })
+                        }}
                       >
                         <SelectTrigger className="w-full">
                           <SelectValue />
@@ -1089,7 +1170,15 @@ function StudioPage() {
                         </SelectContent>
                       </Select>
                     </Field>
-                    <Field label="图片格式 (output_format)">
+
+                    <Field
+                      label="图片格式 (output_format)"
+                      hint={
+                        apiConfig.gptParams.background === 'transparent'
+                          ? '透明背景仅支持 png / webp。'
+                          : undefined
+                      }
+                    >
                       <Select
                         value={apiConfig.gptParams.outputFormat}
                         onValueChange={(v) =>
@@ -1102,7 +1191,12 @@ function StudioPage() {
                         <SelectContent>
                           <SelectItem value="png">png</SelectItem>
                           <SelectItem value="webp">webp</SelectItem>
-                          <SelectItem value="jpeg">jpeg</SelectItem>
+                          <SelectItem
+                            value="jpeg"
+                            disabled={apiConfig.gptParams.background === 'transparent'}
+                          >
+                            jpeg
+                          </SelectItem>
                         </SelectContent>
                       </Select>
                     </Field>

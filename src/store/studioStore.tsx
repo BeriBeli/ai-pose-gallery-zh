@@ -87,8 +87,10 @@ const DEFAULT_API_CONFIG: ApiConfig = {
   gptParams: {
     endpointMode: 'images_edits_json',
     size: '1024x1536',
+    customSize: '1536x2048',
+    responsesModel: 'gpt-6-astra',
     quality: 'high',
-    inputFidelity: 'high',
+    inputFidelity: 'omit',
     background: 'auto',
     outputFormat: 'png',
     moderation: 'auto',
@@ -147,6 +149,34 @@ function migrateComfy(
   return { provider: nextProvider, params: nextParams }
 }
 
+// 旧版 GPT Image 模型 ID 迁移：
+// - gpt-image-2.5 不是官方模型（官方为 -sunburst / -flare）
+// - gpt-image-1 已于 2026-10-23 关停
+const LEGACY_GPT_MODELS: Record<string, string> = {
+  'gpt-image-2.5': 'gpt-image-2.5-sunburst',
+  'gpt-image-1': 'gpt-image-2.5-sunburst',
+}
+
+function migrateGpt(
+  provider: ApiConfig['providers']['gpt'],
+  params: ApiConfig['gptParams']
+): { provider: ApiConfig['providers']['gpt']; params: ApiConfig['gptParams'] } {
+  const nextProvider = { ...provider }
+  const migrated = LEGACY_GPT_MODELS[nextProvider.model]
+  if (migrated) nextProvider.model = migrated
+
+  const nextParams = { ...params }
+  // 旧配置默认给所有模型发送 input_fidelity=high；官方只有 1.5 支持，其他模型应省略
+  if (
+    nextParams.inputFidelity !== 'omit' &&
+    !nextProvider.model.startsWith('gpt-image-1.5') &&
+    !nextProvider.model.startsWith('gpt-image-1-mini')
+  ) {
+    nextParams.inputFidelity = 'omit'
+  }
+  return { provider: nextProvider, params: nextParams }
+}
+
 function mergeStoredConfig(raw: unknown): ApiConfig {
   if (!raw || typeof raw !== 'object') return DEFAULT_API_CONFIG
   const obj = raw as Partial<ApiConfig>
@@ -154,17 +184,21 @@ function mergeStoredConfig(raw: unknown): ApiConfig {
     { ...DEFAULT_API_CONFIG.providers.comfyui, ...obj.providers?.comfyui },
     { ...DEFAULT_API_CONFIG.comfyuiParams, configVersion: 1, ...obj.comfyuiParams }
   )
+  const gpt = migrateGpt(
+    { ...DEFAULT_API_CONFIG.providers.gpt, ...obj.providers?.gpt },
+    { ...DEFAULT_API_CONFIG.gptParams, ...obj.gptParams }
+  )
   return {
     ...DEFAULT_API_CONFIG,
     ...obj,
     providers: {
       gemini: { ...DEFAULT_API_CONFIG.providers.gemini, ...obj.providers?.gemini },
-      gpt: { ...DEFAULT_API_CONFIG.providers.gpt, ...obj.providers?.gpt },
+      gpt: gpt.provider,
       qwen: { ...DEFAULT_API_CONFIG.providers.qwen, ...obj.providers?.qwen },
       doubao: { ...DEFAULT_API_CONFIG.providers.doubao, ...obj.providers?.doubao },
       comfyui: comfy.provider,
     },
-    gptParams: { ...DEFAULT_API_CONFIG.gptParams, ...obj.gptParams },
+    gptParams: gpt.params,
     geminiParams: { ...DEFAULT_API_CONFIG.geminiParams, ...obj.geminiParams },
     qwenParams: { ...DEFAULT_API_CONFIG.qwenParams, ...obj.qwenParams },
     doubaoParams: { ...DEFAULT_API_CONFIG.doubaoParams, ...obj.doubaoParams },
