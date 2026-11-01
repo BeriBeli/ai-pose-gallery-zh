@@ -332,18 +332,10 @@ export function toPublicHttpsUrl(src: string): string {
     return `${window.location.origin}/${clean}`
   }
 
-  // 本地开发态自动映射为源站 Cloudflare Pages 公网 HTTPS 地址，方便云端生图接口直接拉取
-  if (clean.startsWith('img/portrait/')) {
-    const filename = clean.slice('img/portrait/'.length).replace(/\.webp$/i, '.png')
-    return `https://ai-portrait-gallery.pages.dev/img/${filename}`
-  }
-  if (clean.startsWith('thumbs/portrait/')) {
-    return `https://ai-portrait-gallery.pages.dev/thumbs/${clean.slice('thumbs/portrait/'.length)}`
-  }
-  if (clean.startsWith('img/costume/') || clean.startsWith('thumbs/costume/')) {
-    return `https://ai-costume-gallery.pages.dev/${clean}`
-  }
-  return `https://ai-pose-gallery.pages.dev/${clean}`
+  // 本地开发态自动映射为公网 HTTPS 地址，方便云端生图接口直接拉取。
+  // 统一走当前主站：三个旧 pages.dev 域名已不再提供服装/人像图片（会返回 SPA HTML，
+  // 云端接口拉取后会报 "Invalid image data"），主站则完整托管 data/、thumbs/、img/。
+  return `https://ai-pose-gallery.anhao.app/${clean}`
 }
 
 async function srcToPngDataUrl(src: string): Promise<string> {
@@ -1402,11 +1394,14 @@ export async function generateCharacterImage(params: {
   // 1) 用户显式选择了 base64 模式
   // 2) 或者勾选了「附带三合一 Canvas 合成图」（本地动态绘制无公网 URL）
   // 3) 或者使用 Gemini Native 原生接口 / OpenAI multipart/form-data 模式
+  // 4) 本地开发且素材全部来自本地/上传时，GPT 直接转 Data URL，避免外部 CDN 抓取失败
+  const hasOnlyLocalSources = rawSources.every((src) => !/^https?:\/\//i.test(src))
   const needBase64 =
     config.imagePassMode === 'base64' ||
     config.sendStitchedSheet ||
     (provider === 'gemini' && config.geminiParams.endpointMode === 'native') ||
-    (provider === 'gpt' && config.gptParams.endpointMode === 'images_edits')
+    (provider === 'gpt' && config.gptParams.endpointMode === 'images_edits') ||
+    (provider === 'gpt' && isLocalDevHost() && hasOnlyLocalSources)
 
   const imageRefs: string[] = needBase64
     ? await Promise.all(rawSources.map(srcToPngDataUrl))
